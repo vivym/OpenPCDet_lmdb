@@ -2,6 +2,8 @@ import pickle
 
 import os
 import copy
+import io
+import lmdb
 import numpy as np
 import SharedArray
 import torch.distributed as dist
@@ -47,6 +49,16 @@ class DataBaseSampler(object):
                 'pointer': len(self.db_infos[class_name]),
                 'indices': np.arange(len(self.db_infos[class_name]))
             }
+    
+    @property
+    def lmdb_env(self):
+        if not hasattr(self, "_lmdb_env"):
+            self._lmdb_env = lmdb.open(
+                str(self.root_path / "waymo_pcdet.lmdb"), subdir=True,
+                readonly=True, lock=False,
+                readahead=False, meminit=False
+            )
+        return self._lmdb_env
 
     def __getstate__(self):
         d = dict(self.__dict__)
@@ -177,9 +189,12 @@ class DataBaseSampler(object):
                 start_offset, end_offset = info['global_data_offset']
                 obj_points = copy.deepcopy(gt_database_data[start_offset:end_offset])
             else:
-                file_path = self.root_path / info['path']
-                obj_points = np.fromfile(str(file_path), dtype=np.float32).reshape(
-                    [-1, self.sampler_cfg.NUM_POINT_FEATURES])
+                # file_path = self.root_path / info['path']
+                file_key = info['path'].encode()
+                with self.lmdb_env.begin(write=False) as txn:
+                    obj_bytes = txn.get(file_key)
+                obj_points = np.frombuffer(obj_bytes, dtype=np.float32).reshape(
+                    [-1, self.sampler_cfg.NUM_POINT_FEATURES]).copy()
 
             obj_points[:, :3] += info['box3d_lidar'][:3]
 

@@ -6,6 +6,8 @@
 import os
 import pickle
 import copy
+import io
+import lmdb
 import numpy as np
 import torch
 import multiprocessing
@@ -35,6 +37,16 @@ class WaymoDataset(DatasetTemplate):
         if self.use_shared_memory:
             self.shared_memory_file_limit = self.dataset_cfg.get('SHARED_MEMORY_FILE_LIMIT', 0x7FFFFFFF)
             self.load_data_to_shared_memory()
+    
+    @property
+    def lmdb_env(self):
+        if not hasattr(self, "_lmdb_env"):
+            self._lmdb_env = lmdb.open(
+                str(self.root_path / "waymo_pcdet.lmdb"), subdir=True,
+                readonly=True, lock=False,
+                readahead=False, meminit=False
+            )
+        return self._lmdb_env
 
     def set_split(self, split):
         super().__init__(
@@ -55,12 +67,14 @@ class WaymoDataset(DatasetTemplate):
         for k in range(len(self.sample_sequence_list)):
             sequence_name = os.path.splitext(self.sample_sequence_list[k])[0]
             info_path = self.data_path / sequence_name / ('%s.pkl' % sequence_name)
-            info_path = self.check_sequence_name_with_all_version(info_path)
-            if not info_path.exists():
-                num_skipped_infos += 1
-                continue
-            with open(info_path, 'rb') as f:
-                infos = pickle.load(f)
+            #  info_path = self.check_sequence_name_with_all_version(info_path)
+            info_key = str(info_path.relative_to(self.root_path)).encode()
+            with self.lmdb_env.begin(write=False) as txn:
+                info_buf = txn.get(info_key)
+                if info_buf is None:
+                    num_skipped_infos += 1
+                    continue
+                infos = pickle.loads(info_buf)
                 waymo_infos.extend(infos)
 
         self.infos.extend(waymo_infos[:])
@@ -158,6 +172,11 @@ class WaymoDataset(DatasetTemplate):
 
     def get_lidar(self, sequence_name, sample_idx):
         lidar_file = self.data_path / sequence_name / ('%04d.npy' % sample_idx)
+        lidar_file_key = str(lidar_file.relative_to(self.root_path)).encode()
+        with self.lmdb_env.begin(write=False) as txn:
+            lidar_bytes = txn.get(lidar_file_key)
+
+        lidar_file = io.BytesIO(lidar_bytes)
         point_features = np.load(lidar_file)  # (N, 7): [x, y, z, intensity, elongation, NLZ_flag]
 
         points_all, NLZ_flag = point_features[:, 0:5], point_features[:, 5]
